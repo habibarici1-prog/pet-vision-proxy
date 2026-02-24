@@ -1,8 +1,13 @@
 const express = require('express');
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+puppeteer.use(StealthPlugin());
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Render.com uyku modunu engellemek için sağlık taraması
+app.get('/ping', (req, res) => res.status(200).send('pong'));
 
 // ═══════════════════════════════════
 // QUEUE (Kuyruk) Sistemi — RAM Koruması
@@ -97,12 +102,12 @@ async function getBrowser() {
             '--disable-dev-shm-usage',
             '--disable-gpu',
             '--disable-extensions',
-            '--disable-background-networking',
-            '--disable-default-apps',
+            '--disable-blink-features=AutomationControlled',
+            '--window-size=1920,1080',
             '--no-first-run',
             '--single-process',
-            '--disable-features=TranslateUI',
         ],
+        ignoreHTTPSErrors: true,
     });
     return browser;
 }
@@ -1249,10 +1254,82 @@ async function searchPuppis(query) {
 }
 
 // ═══════════════════════════════════
+// CIMRI (META-SCRAPER) PARSER
+// ═══════════════════════════════════
+async function searchCimri(query, pageParam = 1) {
+    const pageNum = parseInt(pageParam) || 1;
+    const cacheKey = `cimri:${query}:p${pageNum}`;
+    const cached = getCached(cacheKey);
+    if (cached) return { products: cached, fromCache: true };
+
+    await acquireSlot();
+    const b = await getBrowser();
+    const page = await b.newPage();
+
+    try {
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+        await page.setViewport({ width: 1366, height: 768 });
+
+        // Gereksiz kaynakları engelle
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            const type = req.resourceType();
+            if (['stylesheet', 'font', 'media'].includes(type)) req.abort();
+            else req.continue();
+        });
+
+        const url = `https://www.cimri.com/arama?q=${encodeURIComponent(query)}${pageNum > 1 ? `&page=${pageNum}` : ''}`;
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.waitForSelector('article', { timeout: 15000 }).catch(() => { });
+
+        const html = await page.content();
+
+        const regex = /<article[^>]*>(.+?)<\/article>/gs;
+        let match;
+        const products = [];
+
+        while ((match = regex.exec(html)) !== null) {
+            const card = match[1];
+
+            const titleMatch = card.match(/title="([^"]+)"/) || card.match(/<h3[^>]*>(.+?)<\/h3>/);
+            const priceMatch = card.match(/([\d.,]+)\s*TL/i);
+            const imgMatch = card.match(/src="([^"]+)"/);
+            const linkMatch = card.match(/href="([^"]+)"/);
+
+            if (titleMatch && priceMatch) {
+                let link = linkMatch ? linkMatch[1] : '';
+                if (link && !link.startsWith('http')) {
+                    link = 'https://www.cimri.com' + link;
+                }
+                const priceStr = priceMatch[1].replace(/\./g, '').replace(',', '.');
+                const priceNum = parseFloat(priceStr);
+
+                products.push({
+                    title: titleMatch[1].replace(/<[^>]+>/g, '').trim(),
+                    price: priceMatch[1] + ' TL',
+                    priceNum: priceNum || null,
+                    image: imgMatch ? imgMatch[1] : '',
+                    url: link,
+                    source: 'cimri',
+                    seller: 'Cimri Fiyat Karşılaştırması',
+                    currency: 'TRY'
+                });
+            }
+        }
+
+        if (products.length > 0) setCache(cacheKey, products, 3600000); // 1 saat
+        return { products, fromCache: false };
+    } finally {
+        await page.close().catch(() => { });
+        releaseSlot();
+    }
+}
+
+// ═══════════════════════════════════
 // API ENDPOINT'LERİ
 // ═══════════════════════════════════
 app.get('/search', async (req, res) => {
-    const { site, q } = req.query;
+    const { site, q, page } = req.query;
     if (!site || !q) {
         return res.status(400).json({ success: false, error: 'site ve q parametreleri gerekli' });
     }
@@ -1260,8 +1337,10 @@ app.get('/search', async (req, res) => {
     try {
         let result;
         switch (site.toLowerCase()) {
+            case 'cimri':
+                result = await searchCimri(q, page);
+                break;
             case 'hepsiburada':
-            case 'hb':
                 result = await searchHepsiburada(q);
                 break;
             case 'n11':
